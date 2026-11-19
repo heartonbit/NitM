@@ -1,13 +1,22 @@
 {
   "name": "nitm",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "version:sync": "node scripts/sync-version.js",
+    "dev": "npm run version:sync && wrangler dev",
+    "deploy": "npm run version:sync && wrangler deploy",
+    "test": "node --test test/*.test.js",
+    "check": "npm run version:sync && node --check src/index.js && node --check src/digest.js && node --check src/mailer.js && node --check public/app.js && wrangler deploy --dry-run",
+    "db:local:migrate": "wrangler d1 migrations apply nitm --local",
+    "db:remote:migrate": "wrangler d1 migrations apply nitm --remote"
   },
   "devDependencies": {
-    "wrangler": "^4.160.0"
+    "wrangler": "^4.164.0"
+  },
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "fast-xml-parser": "^5.12.0"
   }
 }

@@ -1,0 +1,2 @@
+ALTER TABLE lessons ADD COLUMN requested_model TEXT NOT NULL DEFAULT '';
+ALTER TABLE lessons ADD COLUMN response_model TEXT NOT NULL DEFAULT '';

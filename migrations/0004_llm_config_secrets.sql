@@ -1,0 +1,1 @@
+DELETE FROM settings WHERE key IN ('llm_base_url', 'llm_model', 'summary_language');
