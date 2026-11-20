@@ -196,3 +196,19 @@ test("email footer includes the centralized version and LLM model", () => {
   assert.doesNotMatch(emailFooterHtml("2.4.1", "solar-pro4", "<script>"), /<script>/);
   assert.match(markdownToEmailHtml("# Briefing"), /<h1>Briefing<\/h1>/);
 });
+test("LLM tuning falls back to defaults and validates admin input", async () => {
+  const { llmTuning, llmTuningSettings, validateLlmTuningInput, reasoningPayload } = await import("../src/digest.js");
+  const defaults = llmTuning({});
+  assert.equal(defaults.maxTokens.summarize, 12_000);
+  assert.equal(defaults.reasoningEffort, "low");
+  assert.equal(defaults.timeoutMs, 240_000);
+  const custom = llmTuning({ llm_max_tokens_summarize: "20000", llm_reasoning_effort: "disabled", llm_timeout_seconds: "abc" });
+  assert.equal(custom.maxTokens.summarize, 20_000);
+  assert.equal(custom.timeoutMs, 240_000);
+  assert.deepEqual(reasoningPayload(custom.reasoningEffort), { enabled: false });
+  assert.equal(reasoningPayload("omit"), undefined);
+  assert.equal(llmTuningSettings({ llm_batch_chars: "999999999" }).llm_batch_chars, 14_000);
+  assert.deepEqual(validateLlmTuningInput({ llm_max_tokens_final: "9000", timezone: "UTC" }), { llm_max_tokens_final: "9000" });
+  assert.throws(() => validateLlmTuningInput({ llm_max_split_depth: "1.5" }), /invalid_llm_tuning/);
+  assert.throws(() => validateLlmTuningInput({ llm_reasoning_effort: "extreme" }), /invalid_llm_tuning/);
+});

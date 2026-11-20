@@ -6,6 +6,7 @@ const API_ERRORS = {
   invalid_llm_url: "LLM_BASE_URL secret 형식이 올바르지 않습니다. https://로 시작하는 OpenAI 호환 Base URL을 설정해 주세요.",
   llm_connection_error: "LLM endpoint에 연결하지 못했습니다. LLM_BASE_URL secret의 주소와 provider 상태를 확인해 주세요.",
   llm_timeout: "LLM 요청 시간이 초과됐습니다. 잠시 후 다시 시도하거나 뉴스 입력량을 확인해 주세요.",
+  llm_output_truncated: "LLM 응답이 최대 출력 토큰 한도에 도달해 잘렸습니다. 모델이 반복 생성 또는 과도한 추론(reasoning)에 빠졌을 수 있으니 다른 모델을 사용하거나 추론 설정을 확인해 주세요.",
   llm_invalid_response: "LLM 응답이 JSON 형식이 아닙니다. Base URL과 provider 호환성을 확인해 주세요.",
   llm_auth_error: "LLM provider가 인증을 거부했습니다. LLM_API_KEY secret이 올바른지 확인해 주세요.",
   llm_endpoint_not_found: "LLM endpoint를 찾을 수 없습니다. LLM_BASE_URL secret의 API 경로를 확인해 주세요.",
@@ -15,7 +16,31 @@ const API_ERRORS = {
   mail_not_configured: "RESEND_API_KEY secret이 설정되지 않았습니다.",
   email_error: "Resend 메일 전송에 실패했습니다. API key와 발신 주소 설정을 확인해 주세요.",
   test_email_failed: "테스트 메일 처리 중 오류가 발생했습니다. Worker 로그를 확인해 주세요.",
+  invalid_llm_tuning: "LLM 튜닝 값이 허용 범위를 벗어났습니다. 각 항목의 범위를 확인해 주세요.",
 };
+const LLM_TUNING_LABELS = {
+  llm_temperature: ["Temperature", "낮을수록 일관된 출력"],
+  llm_reasoning_effort: ["추론 강도 (reasoning)", "omit: 필드 미전송(OpenRouter 외 제공자) · disabled: 추론 끄기"],
+  llm_timeout_seconds: ["요청 타임아웃 (초)", "호출 1회당 대기 한도"],
+  llm_max_tokens_classify: ["최대 토큰 · 한국 기사 분류", "추론 토큰 포함"],
+  llm_max_tokens_summarize: ["최대 토큰 · 배치 요약", "추론 토큰 포함"],
+  llm_max_tokens_compress: ["최대 토큰 · 요약 압축", "추론 토큰 포함"],
+  llm_max_tokens_final: ["최대 토큰 · 최종 브리핑", "추론 토큰 포함"],
+  llm_batch_chars: ["배치 입력 크기 (문자)", "호출 1회에 넣는 기사 JSON 길이"],
+  llm_max_split_depth: ["잘림 시 분할 재시도 깊이", "0: 재시도 안 함 · 3: 최대 8분할"],
+};
+
+function llmTuningFields(settings) {
+  return Object.entries(settings.llmTuningFields || {}).map(([key, spec]) => {
+    const [label, hint] = LLM_TUNING_LABELS[key] || [key, ""];
+    const value = settings.llmTuning?.[key] ?? spec.default;
+    const range = spec.type === "enum" ? "" : ` · ${spec.min}~${spec.max} · 기본 ${spec.default}`;
+    const input = spec.type === "enum"
+      ? `<select name="${escapeHtml(key)}">${spec.values.map((option) => `<option value="${escapeHtml(option)}" ${option === value ? "selected" : ""}>${escapeHtml(option)}${option === spec.default ? " (기본)" : ""}</option>`).join("")}</select>`
+      : `<input name="${escapeHtml(key)}" type="number" required min="${spec.min}" max="${spec.max}" step="${spec.type === "integer" ? 1 : "0.05"}" value="${escapeHtml(value)}">`;
+    return `<label class="field">${escapeHtml(label)}${input}<small class="muted">${escapeHtml(hint + range)}</small></label>`;
+  }).join("");
+}
 
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
@@ -142,7 +167,13 @@ async function renderAdmin() {
   llmSecretStatus.className = "wide muted";
   const secretStatus = settings.llmSecrets;
   llmSecretStatus.textContent = `LLM Cloudflare secrets · API key: ${secretStatus.apiKey ? "등록됨" : "미등록"} · Base URL: ${secretStatus.baseUrl ? (secretStatus.baseUrlValid ? "등록·형식 정상" : "등록·형식 오류") : "미등록"} · Model: ${secretStatus.model ? "등록됨" : "미등록"} · 출력 언어: 한국어`;
-  settingsForm.querySelector(".actions")?.parentElement?.before(llmSecretStatus);
+  settingsForm.querySelector(".actions")?.before(llmSecretStatus);
+  const tuningHeading = document.createElement("h3");
+  tuningHeading.className = "wide";
+  tuningHeading.style.margin = "12px 0 0";
+  tuningHeading.textContent = "LLM 튜닝 (저장 즉시 다음 요청부터 적용, 배포 불필요)";
+  llmSecretStatus.after(tuningHeading);
+  tuningHeading.insertAdjacentHTML("afterend", llmTuningFields(settings));
 
   document.querySelector("#invite-form").addEventListener("submit", async (event) => {
     event.preventDefault();

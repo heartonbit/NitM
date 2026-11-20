@@ -1,4 +1,4 @@
-import { llmBaseUrlIsValid, llmSecretsConfigured, runDigest, scheduledDigest, sendTestDigest, validateExternalUrl } from "./digest.js";
+import { LLM_TUNING_FIELDS, llmBaseUrlIsValid, llmSecretsConfigured, llmTuningSettings, runDigest, scheduledDigest, sendTestDigest, validateExternalUrl, validateLlmTuningInput } from "./digest.js";
 import { sendEmail } from "./mailer.js";
 
 const SESSION_COOKIE = "nitm_session";
@@ -223,7 +223,13 @@ function configInput(body) {
   if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(sendTime)) {
     throw new HttpError(400, "invalid_schedule_or_model");
   }
-  return { timezone, send_time: sendTime };
+  let tuning;
+  try {
+    tuning = validateLlmTuningInput(body);
+  } catch {
+    throw new HttpError(400, "invalid_llm_tuning");
+  }
+  return { timezone, send_time: sendTime, ...tuning };
 }
 
 async function settings(env) {
@@ -368,6 +374,8 @@ async function api(request, env) {
         model: Boolean(env.LLM_MODEL),
       },
       llmConfigured: llmSecretsConfigured(env),
+      llmTuning: llmTuningSettings(values),
+      llmTuningFields: LLM_TUNING_FIELDS,
     });
   }
   if (path === "/api/admin/settings" && method === "PUT") {
@@ -378,7 +386,7 @@ async function api(request, env) {
         .bind(key, value, isoNow()),
     );
     await env.DB.batch(statements);
-    await audit(env, user, "updateSchedule", "schedule");
+    await audit(env, user, "updateSettings", Object.keys(values).join(","));
     return json({ ok: true });
   }
   if (path === "/api/admin/test-email" && method === "POST") {
@@ -393,6 +401,7 @@ async function api(request, env) {
         invalid_llm_url: 400,
         llm_connection_error: 502,
         llm_timeout: 504,
+  llm_output_truncated: 502,
         llm_invalid_response: 502,
         llm_auth_error: 502,
         llm_endpoint_not_found: 502,

@@ -27,6 +27,7 @@
 | `no_news` | 수집 가능한 기사 없음 | 활성 소스 URL/응답/피드 구조 |
 | `llm_not_configured` | LLM key, Base URL 또는 model secret 누락 | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` secret 등록 상태 |
 | `lesson_generation_error` | LLM 오류 또는 비정상 응답 | 공급자 상태·모델 접근·요청 제한 |
+| `llm_output_truncated` | LLM 응답이 `max_tokens` 한도에 도달(`finish_reason: length`) | 모델의 반복 생성·과도한 reasoning 여부, Worker 로그의 `stage`/`usage`, 필요 시 모델 교체 |
 | `email_error` | Resend 전송 실패 | 키, 발신 도메인, 수신 제한/계정 |
 | `digest_error` | 기타 파이프라인 오류 | Worker 상세 로그와 D1 실행 기록 |
 

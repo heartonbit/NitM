@@ -9,11 +9,78 @@ const XML = new XMLParser({
   trimValues: true,
   processEntities: true,
 });
-const MAX_LLM_BATCH_CHARS = 14_000;
 const MAX_ARTICLE_BODY_CHARS = 6_000;
 const MAX_ARTICLE_HTML_BYTES = 2_000_000;
-// LLM 단일 호출 타임아웃. Cron 실행의 전체 벽시계 한도(15분)와 다중 배치 호출 수를 고려해 600초로 상향.
-const LLM_REQUEST_TIMEOUT_MS = 600_000;
+
+// 관리자 화면에서 배포 없이 바꿀 수 있는 LLM 튜닝 값. D1 settings 테이블에 저장되며,
+// 값이 없거나 범위를 벗어나면 default를 사용한다.
+// - max_tokens는 추론 토큰을 포함한다. 미지정 시 제공자 최대치까지 생성되어 반복/추론 폭주가 생길 수 있다.
+// - reasoning_effort: omit(필드 미전송) | disabled(추론 끄기) | minimal | low | medium | high (OpenRouter `reasoning` 파라미터)
+// - timeout은 Cron 실행 벽시계 한도(15분)를 넘지 않도록 제한한다.
+export const LLM_TUNING_FIELDS = {
+  llm_temperature: { type: "number", min: 0, max: 2, default: 0.2 },
+  llm_reasoning_effort: { type: "enum", values: ["omit", "disabled", "minimal", "low", "medium", "high"], default: "low" },
+  llm_timeout_seconds: { type: "integer", min: 10, max: 840, default: 240 },
+  llm_max_tokens_classify: { type: "integer", min: 256, max: 131_072, default: 4_000 },
+  llm_max_tokens_summarize: { type: "integer", min: 256, max: 131_072, default: 12_000 },
+  llm_max_tokens_compress: { type: "integer", min: 256, max: 131_072, default: 12_000 },
+  llm_max_tokens_final: { type: "integer", min: 256, max: 131_072, default: 16_000 },
+  llm_batch_chars: { type: "integer", min: 2_000, max: 200_000, default: 14_000 },
+  llm_max_split_depth: { type: "integer", min: 0, max: 5, default: 3 },
+};
+
+function parseTuningValue(spec, raw) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return undefined;
+  if (spec.type === "enum") {
+    const value = String(raw).trim();
+    return spec.values.includes(value) ? value : undefined;
+  }
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value < spec.min || value > spec.max) return undefined;
+  if (spec.type === "integer" && !Number.isInteger(value)) return undefined;
+  return value;
+}
+
+// 저장된 settings에서 유효한 튜닝 값을 읽는다(관리자 화면 표시용, settings 키 그대로).
+export function llmTuningSettings(settings = {}) {
+  return Object.fromEntries(Object.entries(LLM_TUNING_FIELDS).map(([key, spec]) =>
+    [key, parseTuningValue(spec, settings[key]) ?? spec.default]));
+}
+
+// 관리자 입력 검증. 전달된 키만 검사하며 하나라도 잘못되면 invalid_llm_tuning.
+export function validateLlmTuningInput(body = {}) {
+  const values = {};
+  for (const [key, spec] of Object.entries(LLM_TUNING_FIELDS)) {
+    if (body[key] === undefined) continue;
+    const parsed = parseTuningValue(spec, body[key]);
+    if (parsed === undefined) throw new Error("invalid_llm_tuning");
+    values[key] = String(parsed);
+  }
+  return values;
+}
+
+export function llmTuning(settings = {}) {
+  const values = llmTuningSettings(settings);
+  return {
+    temperature: values.llm_temperature,
+    reasoningEffort: values.llm_reasoning_effort,
+    timeoutMs: values.llm_timeout_seconds * 1000,
+    maxTokens: {
+      classify: values.llm_max_tokens_classify,
+      summarize: values.llm_max_tokens_summarize,
+      compress: values.llm_max_tokens_compress,
+      final: values.llm_max_tokens_final,
+    },
+    batchChars: values.llm_batch_chars,
+    maxSplitDepth: values.llm_max_split_depth,
+  };
+}
+
+export function reasoningPayload(effort) {
+  if (effort === "omit") return undefined;
+  if (effort === "disabled") return { enabled: false };
+  return { effort };
+}
 
 function isoNow() {
   return new Date().toISOString();
@@ -293,7 +360,7 @@ export function llmBaseUrlIsValid(raw) {
   }
 }
 
-export function itemChunks(items, maxChars = MAX_LLM_BATCH_CHARS) {
+export function itemChunks(items, maxChars = LLM_TUNING_FIELDS.llm_batch_chars.default) {
   const chunks = [];
   let chunk = [];
   let chunkChars = 2;
@@ -388,14 +455,14 @@ export function parseKoreaRelatedIds(content, articles) {
   return [...new Set(accepted)];
 }
 
-async function generateSummary(env, date, items) {
+async function generateSummary(env, date, items, tuning = llmTuning()) {
   if (!llmSecretsConfigured(env)) throw new Error("llm_not_configured");
   const promptResponse = await env.ASSETS.fetch(new Request("https://nitm-assets/prompts/news_summary.md"));
   if (!promptResponse.ok) throw new Error("prompt_not_found");
   const promptTemplate = await promptResponse.text();
   const endpoint = llmEndpoint(env.LLM_BASE_URL);
   const responseModels = new Set();
-  const requestModel = async (task, batch, minLength = 20) => {
+  const requestModel = async (task, batch, { minLength = 20, maxTokens = tuning.maxTokens.summarize, stage = "unknown" } = {}) => {
     const prompt = promptTemplate
       .replace("{{date}}", date)
       .replace("{{task}}", task)
@@ -405,8 +472,14 @@ async function generateSummary(env, date, items) {
       response = await fetch(endpoint, {
         method: "POST",
         headers: { Authorization: `Bearer ${env.LLM_API_KEY}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: env.LLM_MODEL, messages: [{ role: "user", content: prompt }], temperature: 0.2 }),
-        signal: AbortSignal.timeout(LLM_REQUEST_TIMEOUT_MS),
+        body: JSON.stringify({
+          model: env.LLM_MODEL,
+          messages: [{ role: "user", content: prompt }],
+          temperature: tuning.temperature,
+          max_tokens: maxTokens,
+          reasoning: reasoningPayload(tuning.reasoningEffort),
+        }),
+        signal: AbortSignal.timeout(tuning.timeoutMs),
       });
     } catch (error) {
       const errorName = error instanceof Error ? error.name : "unknown";
@@ -444,9 +517,51 @@ async function generateSummary(env, date, items) {
       throw new Error("llm_invalid_response");
     }
     if (typeof payload.model === "string" && payload.model.trim()) responseModels.add(payload.model.trim().slice(0, 120));
-    const content = payload.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || content.trim().length < minLength) throw new Error("lesson_generation_error");
+    const choice = payload.choices?.[0];
+    const finishReason = choice?.finish_reason ?? null;
+    const content = choice?.message?.content;
+    if (finishReason === "length") {
+      console.error("LLM output truncated", JSON.stringify({
+        stage,
+        requestedModel: env.LLM_MODEL,
+        responseModel: payload.model ?? null,
+        provider: payload.provider ?? null,
+        maxTokens,
+        finishReason,
+        nativeFinishReason: choice?.native_finish_reason ?? null,
+        usage: payload.usage ?? null,
+        contentLength: typeof content === "string" ? content.length : 0,
+      }));
+      throw new Error("llm_output_truncated");
+    }
+    if (typeof content !== "string" || content.trim().length < minLength) {
+      console.error("LLM empty or short content", JSON.stringify({
+        stage,
+        requestedModel: env.LLM_MODEL,
+        responseModel: payload.model ?? null,
+        provider: payload.provider ?? null,
+        finishReason,
+        usage: payload.usage ?? null,
+        contentLength: typeof content === "string" ? content.length : 0,
+      }));
+      throw new Error("lesson_generation_error");
+    }
     return { content: content.trim() };
+  };
+
+  // 출력이 max_tokens에서 잘리면 배치를 반으로 나눠 재시도한다. 결과 노트는 입력 순서대로 이어 붙인다.
+  const requestWithSplit = async (buildTask, batch, options, depth = 0) => {
+    try {
+      return (await requestModel(buildTask(), batch, options)).content;
+    } catch (error) {
+      const truncated = error instanceof Error && error.message === "llm_output_truncated";
+      if (!truncated || batch.length < 2 || depth >= tuning.maxSplitDepth) throw error;
+      console.warn("LLM output truncated; splitting batch", JSON.stringify({ stage: options.stage, size: batch.length, depth }));
+      const middle = Math.ceil(batch.length / 2);
+      const first = await requestWithSplit(buildTask, batch.slice(0, middle), options, depth + 1);
+      const second = await requestWithSplit(buildTask, batch.slice(middle), options, depth + 1);
+      return `${first}\n\n${second}`;
+    }
   };
 
   const classifierInputs = items.map((item, index) => ({
@@ -456,11 +571,11 @@ async function generateSummary(env, date, items) {
     summary: item.summary,
   }));
   const koreaRelatedIds = new Set();
-  for (const batch of itemChunks(classifierInputs)) {
+  for (const batch of itemChunks(classifierInputs, tuning.batchChars)) {
     const result = await requestModel(
       "Classify conservatively. Mark a story as Korea-related only when its main event or subject is South Korea, North Korea, a Korean person, or a Korean government, company, institution, culture, or society. Exclude passing background mentions, comparisons, one-sentence references, and speculative market effects. For every selected story, provide a short exact evidence quote copied from its title; the quote itself must contain a clear Korea identifier such as Korea/Korean/Seoul/Samsung. Exclude a story if Korea is mentioned only in its summary and not in its title. Return only one JSON object with this schema: {\"koreaRelatedArticles\":[{\"id\":1,\"evidence\":\"South Korea\"}]}. Return an empty array when none qualify. Do not add any explanation outside the JSON.",
       batch,
-      2,
+      { minLength: 2, maxTokens: tuning.maxTokens.classify, stage: "classify" },
     );
     for (const id of parseKoreaRelatedIds(result.content, batch)) koreaRelatedIds.add(id);
   }
@@ -484,25 +599,27 @@ async function generateSummary(env, date, items) {
   const chunks = itemChunks(items.map((item) => {
     const formatted = formatArticleForSummary(item);
     return { ...formatted, title: `${formatted.title} [[published:${formatted.publicationLabel}]]` };
-  }));
+  }), tuning.batchChars);
   const partials = [];
   for (const [index, chunk] of chunks.entries()) {
-    const result = await requestModel(
-      `Summarize every story in this batch in Korean in one or two sentences each. Each input title begins with its source in braces and ends with an exact [[published:...]] timestamp marker. Keep both exactly and use the full title line as the heading. Do not convert timezones. Do not combine or omit stories in this stage. Preserve the timestamp and confirmed key facts. Do not write an introduction or source list. Batch ${index + 1} of ${chunks.length}.`,
+    const notes = await requestWithSplit(
+      () => `Summarize every story in this batch in Korean in one or two sentences each. Each input title begins with its source in braces and ends with an exact [[published:...]] timestamp marker. Keep both exactly and use the full title line as the heading. Do not convert timezones. Do not combine or omit stories in this stage. Preserve the timestamp and confirmed key facts. Do not write an introduction or source list. Batch ${index + 1} of ${chunks.length}.`,
       chunk,
+      { maxTokens: tuning.maxTokens.summarize, stage: "summarize" },
     );
-    partials.push({ batch: index + 1, notes: result.content });
+    partials.push({ batch: index + 1, notes });
   }
 
   let synthesisInputs = partials;
-  while (JSON.stringify(synthesisInputs).length > MAX_LLM_BATCH_CHARS) {
+  while (JSON.stringify(synthesisInputs).length > tuning.batchChars) {
     const reduced = [];
-    for (const [index, chunk] of itemChunks(synthesisInputs).entries()) {
-      const result = await requestModel(
-        "Compress the supplied Korean story notes while preserving every story, its exact {source} title prefix, and every [[published:...]] timestamp marker unchanged. Do not convert timezones or add new facts. Do not write a source list.",
+    for (const [index, chunk] of itemChunks(synthesisInputs, tuning.batchChars).entries()) {
+      const notes = await requestWithSplit(
+        () => "Compress the supplied Korean story notes while preserving every story, its exact {source} title prefix, and every [[published:...]] timestamp marker unchanged. Do not convert timezones or add new facts. Do not write a source list.",
         chunk,
+        { maxTokens: tuning.maxTokens.compress, stage: "compress" },
       );
-      reduced.push({ batch: index + 1, notes: result.content });
+      reduced.push({ batch: index + 1, notes });
     }
     synthesisInputs = reduced;
   }
@@ -510,6 +627,7 @@ async function generateSummary(env, date, items) {
   const final = await requestModel(
     "Write a complete Korean-language news briefing that covers every supplied story note. Merge stories covering the same topic/event into one concise summary. For each topic group, format its heading strictly as `{source names} Korean topic headline [[published:timestamp(s)]]` with nothing before `{` (e.g., `### {FT} 엔비디아 사태 후폭풍 [[published:...]]`). Combine source names in braces separated by commas and preserve every supplied publication timestamp marker exactly, separated by semicolons when merging multiple stories. Do not convert timestamps to another timezone. If any stories are directly related to Korea, put them in the first section immediately after the main title, then organize other international news by topic. Do not create a Korea section if none qualify. Preserve each story's distinct confirmed facts. Use one concise H1 title and clear section headings. Do not create a sources section; the system will append the verified source links.",
     synthesisInputs,
+    { maxTokens: tuning.maxTokens.final, stage: "final" },
   );
   const withStats = insertHeaderStats(final.content, items);
   const markdown = appendSourcesSection(withStats, items);
@@ -530,7 +648,7 @@ export async function sendTestDigest(env, recipient) {
   const { items } = await collect(sources.results);
   if (!items.length) throw new Error("no_news");
   const { date } = dateTimeInZone(new Date(), config.timezone || "UTC");
-  const lesson = await generateSummary(env, date, items);
+  const lesson = await generateSummary(env, date, items, llmTuning(config));
   await sendEmail(env, {
     to: recipient,
     subject: `[테스트] NitM | ${lesson.title}`,
@@ -573,7 +691,7 @@ export async function runDigest(env, { manual = false, now = new Date() } = {}) 
       const { items, failedSources } = await collect(sourceResult.results);
       counts.collected = items.length;
       if (!items.length) throw new Error("no_news");
-      const generated = await generateSummary(env, date, items);
+      const generated = await generateSummary(env, date, items, llmTuning(settings));
       lesson = { ...generated, sources_json: JSON.stringify({ items, failedSources }) };
       await env.DB.prepare(`INSERT INTO lessons (date, title, markdown, sources_json, model, requested_model, response_model, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -609,7 +727,7 @@ export async function runDigest(env, { manual = false, now = new Date() } = {}) 
     await env.DB.prepare("UPDATE digest_locks SET status=?, finished_at=? WHERE date=?").bind(counts.failed ? "failed" : "sent", isoNow(), date).run();
     return { date, status, counts };
   } catch (error) {
-    const code = error instanceof Error && ["no_news", "llm_not_configured", "lesson_generation_error"].includes(error.message)
+    const code = error instanceof Error && ["no_news", "llm_not_configured", "lesson_generation_error", "llm_output_truncated"].includes(error.message)
       ? error.message
       : "digest_error";
     console.error("Digest run failed", code);
