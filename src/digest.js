@@ -108,7 +108,11 @@ function text(value) {
 }
 
 function plain(value, limit = 1200) {
-  return text(value).replace(/<!\[CDATA\[|\]\]>/g, "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, limit);
+  const raw = text(value).replace(/<!\[CDATA\[|\]\]>/g, "");
+  if (!raw) return "";
+  // cheerio로 파싱 후 .text()를 호출하면 태그 제거와 &#8216;, &amp; 등의 디코딩이 한 번에 처리됩니다.
+  const decoded = load(`<div>${raw}</div>`)("div").text();
+  return decoded.replace(/\s+/g, " ").trim().slice(0, limit);
 }
 
 function entriesOf(feed) {
@@ -278,6 +282,10 @@ async function collect(sources, now = new Date()) {
         const title = plain(entry.title, 300);
         const url = entryLink(entry, source.url);
         if (!title || !/^https?:/.test(url)) return null;
+
+        // [추가] Partner Content / Sponsored 기사 필터링
+        if (/\[?\s*(?:partner content|sponsored)\s*\]?/i.test(title)) return null;
+
         const publishedText = plain(entry.pubDate ?? entry.published ?? entry.updated ?? entry["dc:date"] ?? entry.date ?? "", 100);
         const publishedTime = Date.parse(publishedText);
         if (!Number.isFinite(publishedTime)) return null;
@@ -625,7 +633,7 @@ async function generateSummary(env, date, items, tuning = llmTuning()) {
   }
 
   const final = await requestModel(
-    "Write a complete Korean-language news briefing that covers every supplied story note. Merge stories covering the same topic/event into one concise summary. For each topic group, format its heading strictly as `{source names} Korean topic headline [[published:timestamp(s)]]` with nothing before `{` (e.g., `### {FT} 엔비디아 사태 후폭풍 [[published:...]]`). Combine source names in braces separated by commas and preserve every supplied publication timestamp marker exactly, separated by semicolons when merging multiple stories. Do not convert timestamps to another timezone. If any stories are directly related to Korea, put them in the first section immediately after the main title, then organize other international news by topic. Do not create a Korea section if none qualify. Preserve each story's distinct confirmed facts. Use one concise H1 title and clear section headings. Do not create a sources section; the system will append the verified source links.",
+    "Write a complete Korean-language news briefing that covers every supplied story note. Merge stories covering the same topic/event into one concise summary. For each topic group, format its heading strictly as `{source names} Korean topic headline [[published:timestamp]]` with nothing before `{` (e.g., `### {FT} 엔비디아 사태 후폭풍 [[published:...]]`). Combine source names in braces separated by commas. When merging multiple stories, keep ONLY the single earliest (oldest) `[[published:...]]` timestamp marker and discard the rest. Do not convert timestamps to another timezone. If any stories are directly related to Korea, put them in the first section immediately after the main title, then organize other international news by topic. Do not create a Korea section if none qualify. Preserve each story's distinct confirmed facts. Use one concise H1 title and clear section headings. Do not create a sources section; the system will append the verified source links.",
     synthesisInputs,
     { maxTokens: tuning.maxTokens.final, stage: "final" },
   );
